@@ -29,7 +29,7 @@ import json
 import shutil
 import logging
 import re
-import tempfile
+import uuid
 import traceback
 import threading
 from pathlib import Path
@@ -320,17 +320,31 @@ def copy_uploaded_to(file_obj, target_dir: Path, filename: str = None) -> str:
     return str(target_path)
 
 
-_TMP_UPLOADS = Path(tempfile.gettempdir()) / "vae_lstm_webui_uploads"
+_TMP_UPLOADS = Path(__file__).parent.resolve() / "temp" / "uploads"
 
 
 def stage_uploaded_video(file_obj) -> str:
-    """把上传的视频暂存到系统临时目录（不会被 rmtree），返回绝对路径"""
-    return copy_uploaded_to(file_obj, _TMP_UPLOADS)
+    """把上传的视频暂存到项目根目录的 temp/uploads/（不会被 rmtree），返回绝对路径。
+    文件名用 uuid 重新生成，避免中文/括号/空格路径导致 soundfile / cv2 / ffmpeg 失败。
+    """
+    src = _resolve_uploaded_path(file_obj)
+    if not src or not os.path.exists(src):
+        raise ValueError(f"上传文件路径无效: {src}")
+    suffix = Path(src).suffix or ".mp4"
+    target_filename = f"video_{uuid.uuid4().hex}{suffix}"
+    return copy_uploaded_to(file_obj, _TMP_UPLOADS, filename=target_filename)
 
 
 def stage_uploaded_audio(file_obj, task_dir_name: str) -> str:
-    """把音频暂存到 data/<任务>/ 下，保证和 Preprocessor 数据共存以便管理"""
-    return copy_uploaded_to(file_obj, DATA_DIR / task_dir_name)
+    """把音频暂存到 data/<任务>/temp/ 下，保证和 Preprocessor 数据共存以便管理。
+    文件名用 uuid 重新生成，避免中文/括号/空格路径导致 soundfile 失败。
+    """
+    src = _resolve_uploaded_path(file_obj)
+    if not src or not os.path.exists(src):
+        raise ValueError(f"上传文件路径无效: {src}")
+    suffix = Path(src).suffix or ".wav"
+    target_filename = f"audio_{uuid.uuid4().hex}{suffix}"
+    return copy_uploaded_to(file_obj, DATA_DIR / task_dir_name / "temp", filename=target_filename)
 
 
 def sanitize_title(title: str) -> str:
@@ -342,15 +356,26 @@ def sanitize_title(title: str) -> str:
 
 
 def list_cuda_devices():
-    """列出可用 CUDA 设备，格式：['cuda', 'cuda:0', 'cuda:1', ...]"""
-    devices = ["cuda"]
+    """列出可用推理设备，与 inference.py 的 _parse_device 保持一致。
+
+    - 有 CUDA: ['cuda', 'cuda:0', 'cuda:1', ..., 'cpu', 'mps'?]
+    - 仅 MPS（Apple Silicon）: ['mps', 'cpu']
+    - 都没有: ['cpu']
+    """
+    devices = []
     try:
         import torch
         if torch.cuda.is_available():
+            devices.append("cuda")
             for i in range(torch.cuda.device_count()):
                 devices.append(f"cuda:{i}")
+        # MPS（Apple Silicon）
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            devices.append("mps")
     except Exception:
         pass
+    if "cpu" not in devices:
+        devices.append("cpu")
     return devices
 
 
@@ -435,14 +460,14 @@ def run_preprocess_ui(
 
     try:
         # 1. 把上传视频暂存到系统临时目录（不会被 rmtree），不再归档到 data/uploads/
-        video_filename = Path(_resolve_uploaded_path(video)).name
+        # video_filename = Path(_resolve_uploaded_path(video)).name
         video_save_path = stage_uploaded_video(video)
         # 如果用户传的文件没有扩展名，强制补 .mp4 防止 cv2 失败
         if not Path(video_save_path).suffix:
             mp4_path = video_save_path + ".mp4"
             os.rename(video_save_path, mp4_path)
             video_save_path = mp4_path
-            video_filename = Path(video_save_path).name
+            # video_filename = Path(video_save_path).name
         print(f"[WebUI] 已暂存上传视频: {video_save_path}")
 
         # 2. 校验 cv2 能读
@@ -544,12 +569,16 @@ def run_inference_ui(
         if os.path.exists(output_video):
             os.remove(output_video)
 
-        # 把中间临时 avi 显式放到系统临时目录，推理完一起清掉
-        import tempfile as _tempfile
-        tmp_dir = Path(_tempfile.gettempdir()) / "vae_lstm_webui_tmp"
+        # 把中间临时 avi / 16k wav 放到项目根目录的 temp/ 下，
+        # 避免 soundfile 在 C:\Users\Administrator\AppData\Local\Temp\
+        # 这种路径下偶发 LibsndfileError: System error
+        # 文件名用 uuid，完全避免中文/括号/空格
+        project_root = Path(__file__).parent.resolve()
+        tmp_dir = project_root / "temp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        video_temp_path = str(tmp_dir / f"{preprocess_dir}_{ts}_temp.avi")
-        audio_temp_path = str(tmp_dir / f"{preprocess_dir}_{ts}_audio_16k.wav")
+        run_uid = uuid.uuid4().hex
+        video_temp_path = str(tmp_dir / f"{run_uid}_temp.avi")
+        audio_temp_path = str(tmp_dir / f"{run_uid}_audio_16k.wav")
         # 清掉可能存在的旧临时
         for f in [video_temp_path, audio_temp_path]:
             if os.path.exists(f):
@@ -715,7 +744,7 @@ def build_ui():
                         device_pre = gr.Radio(
                             choices=cuda_choices,
                             value=cfg.get("device", "cuda"),
-                            label="推理设备",
+                            label="推理设备（预处理需要 CUDA / cuda:N）",
                         )
                         pre_btn = gr.Button("🚀 开始预处理", variant="primary")
 
@@ -765,7 +794,7 @@ def build_ui():
                         )
                         batch_size_inf = gr.Slider(
                             minimum=1,
-                            maximum=16,
+                            maximum=512,
                             value=2,
                             step=1,
                             label="推理 batch_size (显存不足调小，默认 2)",
@@ -790,7 +819,7 @@ def build_ui():
                         device_inf = gr.Radio(
                             choices=cuda_choices,
                             value=cfg.get("device", "cuda"),
-                            label="推理设备",
+                            label="推理设备 (cuda / cuda:N / cpu / mps)",
                         )
                         with gr.Row(elem_classes=["folder-row"]):
                             output_dir_in = gr.Textbox(
