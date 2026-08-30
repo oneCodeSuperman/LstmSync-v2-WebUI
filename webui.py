@@ -24,6 +24,7 @@ for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
 os.environ["NO_PROXY"] = "*"
 
 
+import os
 import sys
 import json
 import shutil
@@ -32,6 +33,7 @@ import re
 import uuid
 import traceback
 import threading
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
@@ -122,6 +124,10 @@ from inference import Inference
 DATA_DIR = Path("./data").resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# 直播预处理数据根目录
+DATA_LIVE_DIR = Path("./data_live").resolve()
+DATA_LIVE_DIR.mkdir(parents=True, exist_ok=True)
+
 CONFIG_PATH = Path("./config.json").resolve()
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -150,12 +156,33 @@ def list_preprocess_dirs():
     return dirs or ["(尚无预处理数据)"]
 
 
+def list_live_data_dirs():
+    """列出 data_live/ 下直播预处理生成的目录（含 meta.json + video_25fps.mp4）"""
+    if not DATA_LIVE_DIR.exists():
+        return ["(尚无直播预处理数据，请先运行『③ 直播预处理』)"]
+    dirs = []
+    for p in sorted(DATA_LIVE_DIR.iterdir(), reverse=True):
+        if not p.is_dir():
+            continue
+        if (p / "meta.json").exists() and (p / "video_25fps.mp4").exists():
+            dirs.append(p.name)
+    return dirs or ["(尚无直播预处理数据，请先运行『③ 直播预处理』)"]
+
+
 # ============== 日志捕获 + 单行刷新 ==============
 class LogCapture:
     """捕获 print() 输出，把 tqdm 进度条折叠成单行可滚动；
     同时识别 tqdm 的百分比，调用外部 progress 回调推到 Gradio。"""
 
+    # tqdm "%|...| N/T" 格式：含百分数 + 进度条字符
     PROGRESS_RE = re.compile(r"^.*?(\d+)%\|[█▏▎▍▌▋▊▉ ]+\|\s*(\d+)/(\d+).*$")
+    # tqdm "Nit [elapsed, X.XXit/s]" 格式：tqdm 在 total 未知 / 终端太窄时会切成这种格式
+    # 例: Inference (full mode): 11it [00:01,  8.36it/s]
+    #     Encoding audio (full mode): 5/30 [00:02,  2.34it/s]
+    PROGRESS_IT_RE = re.compile(
+        r"^(?P<desc>.+?):\s*(?P<cur>\d+)(?:it)?\s*\[(?P<elapsed>[^,]+),\s*(?P<rate>[\d.]+)it/s\]"
+        r"(?:\s*\[(?P<post>.*?)\])?\s*$"
+    )
 
     def __init__(self):
         self.lines = []
@@ -165,6 +192,9 @@ class LogCapture:
         self.progress_cb = None
         self._last_pct = -1  # 节流：相同百分比只推一次
         self._cur_desc = ""  # 当前处理阶段描述，避免 AttributeError
+        # it/s 格式进度折叠：把同一 desc 的最近一行存这里，下一帧到达时替换而不是追加
+        self._last_it_line = None
+        self._last_it_idx = -1
 
     # 已知无害的 asyncio / Windows stream cleanup 噪音，不写到日志面板
     _FILTER_PATTERNS = (
@@ -202,11 +232,35 @@ class LogCapture:
                             self.progress_cb(pct / 100.0, label)
                         except Exception:
                             pass
+                    # it/s 格式计数清零
+                    self._last_it_line = None
+                    continue
+            # tqdm "Nit [t, X.XXit/s]" 格式（total 未知或终端太窄时）
+            if "it/s]" in stripped:
+                m = self.PROGRESS_IT_RE.match(stripped)
+                if m:
+                    desc = m.group("desc").strip()
+                    cur = int(m.group("cur"))
+                    rate = float(m.group("rate"))
+                    line = f"[{ts}] {desc}: {cur}it [{m.group('elapsed')}, {rate:.2f}it/s]"
+                    with self.lock:
+                        if self._last_it_line is not None:
+                            # 用最新一行替换上一行：先去掉上一行
+                            try:
+                                self.lines.remove(self._last_it_line)
+                            except ValueError:
+                                pass
+                        self.lines.append(line)
+                        if len(self.lines) > 1500:
+                            self.lines = self.lines[-1000:]
+                    self._last_it_line = line
                     continue
             with self.lock:
                 self.lines.append(f"[{ts}] {stripped}")
                 if len(self.lines) > 1500:
                     self.lines = self.lines[-1000:]
+            # 出现非 tqdm 输出，重置 it/s 折叠状态
+            self._last_it_line = None
 
     def _replace_progress(self):
         with self.lock:
@@ -436,6 +490,10 @@ def list_preprocess_dirs_ui():
     return gr.update(choices=list_preprocess_dirs())
 
 
+def list_live_data_dirs_ui():
+    return gr.update(choices=list_live_data_dirs())
+
+
 # ============== 任务 1：预处理 ==============
 def run_preprocess_ui(
     title,
@@ -625,10 +683,324 @@ def run_inference_ui(
         return f"推理失败: {e}", None
 
 
+# ============== 任务 3：直播预处理 ==============
+# 常见音频后缀（选择目录时用于过滤无关文件）
+_AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".aac", ".ogg", ".wma"}
+
+
+def _audio_sort_key(name: str):
+    """音频排序键：优先按文件名中出现的数字排序（与 extract_number 逻辑一致），无数字按名称"""
+    m = re.search(r"\d+", name)
+    if m:
+        return (0, int(m.group()), name.lower())
+    return (1, 0, name.lower())
+
+
+def run_live_preprocess_ui(
+    title,
+    video,
+    audios,
+    face_size,
+    frame_batch_size,
+    res_preset_label,
+    sync_offset,
+    device,
+):
+    log_capture.clear()
+
+    title_clean = sanitize_title(title)
+    if not title_clean:
+        return "请填写直播标题！", gr.update()
+    if video is None:
+        return "请先上传视频！", gr.update()
+    audios_dir = (audios or "").strip().strip('"')
+    if not audios_dir:
+        return "请输入或选择音频目录！", gr.update()
+    if not os.path.isdir(audios_dir):
+        return f"音频目录不存在: {audios_dir}", gr.update()
+
+    cfg = load_config()
+    api_key = cfg.get("api_key", "").strip()
+    if not api_key:
+        return "API Key 未配置，请先在『设置』中保存 API Key。", gr.update()
+
+    try:
+        from preprocess_live import PreprocessLive
+
+        # 1. 暂存视频（不会被 rmtree）
+        video_save_path = stage_uploaded_video(video)
+        if not Path(video_save_path).suffix:
+            mp4_path = video_save_path + ".mp4"
+            os.rename(video_save_path, mp4_path)
+            video_save_path = mp4_path
+        print(f"[WebUI] 已暂存上传视频: {video_save_path}")
+
+        # 2. 暂存所选目录中的音频到 temp/live_audios_<标题>/（不能放 output_dir 内，run_video 会 rmtree）
+        #    按原文件名中的数字排序后重命名为纯数字，保证 extract_number 顺序正确，避免中文/空格导致 ffmpeg 失败
+        project_root = Path(__file__).parent.resolve()
+        audios_stage_dir = project_root / "temp" / f"live_audios_{title_clean}"
+        if audios_stage_dir.exists():
+            shutil.rmtree(audios_stage_dir, ignore_errors=True)
+        audios_stage_dir.mkdir(parents=True, exist_ok=True)
+
+        audio_files = []
+        for root, _, names in os.walk(audios_dir):
+            for name in names:
+                src = os.path.join(root, name)
+                if Path(src).suffix.lower() not in _AUDIO_EXTS:
+                    continue
+                audio_files.append(src)
+        if not audio_files:
+            return "音频目录中没有找到音频文件（支持 " + "/".join(sorted(_AUDIO_EXTS)) + "）！", gr.update()
+        audio_files.sort(key=lambda p: _audio_sort_key(os.path.basename(p)))
+        for idx, src in enumerate(audio_files):
+            suffix = Path(src).suffix or ".wav"
+            shutil.copy(src, audios_stage_dir / f"{idx}{suffix}")
+        print(f"[WebUI] 已暂存 {len(audio_files)} 个音频: {audios_dir} -> {audios_stage_dir}")
+
+        # 3. 模型路径
+        face_size = int(face_size)
+        vae_encoder_path = f"./checkpoints/{face_size}.encoder.onnx"
+        hubert_path = "./checkpoints/chinese-hubert-large/"
+        if not os.path.exists(vae_encoder_path):
+            return f"找不到 VAE Encoder 模型: {vae_encoder_path}", gr.update()
+        if not os.path.exists(hubert_path):
+            return f"找不到 Hubert 模型: {hubert_path}", gr.update()
+
+        # 4. 输出目录：data_live/<标题>/
+        dir_name = title_clean
+        output_dir = str(DATA_LIVE_DIR / dir_name)
+
+        res_map = {
+            "不压缩(原分辨率)": None,
+            "480p": "480p",
+            "720p": "720p",
+            "1080p": "1080p",
+        }
+        res_preset = res_map.get(res_preset_label, "1080p")
+
+        print(f"[WebUI] 开始直播预处理: title={dir_name}, output={output_dir}")
+
+        pre = PreprocessLive(
+            face_size=face_size,
+            vae_encoder_path=vae_encoder_path,
+            hubert_path=hubert_path,
+            device=device,
+            api_key=api_key,
+            sync_offset=int(sync_offset),
+        )
+        pre.run(
+            video_path=video_save_path,
+            audios_dir=str(audios_stage_dir),
+            output_dir=output_dir,
+            fps=25,
+            frame_batch_size=int(frame_batch_size),
+            res_preset=res_preset,
+        )
+
+        print(f"[WebUI] 直播预处理完成！输出目录: {output_dir}")
+        return (
+            f"直播预处理完成！\n标题: {dir_name}\n输出: {output_dir}",
+            gr.update(choices=list_live_data_dirs(), value=dir_name),
+        )
+    except Exception as e:
+        traceback.print_exc()
+        return f"直播预处理失败: {e}", gr.update()
+
+
+# ============== 任务 4：直播推流 ==============
+# 全局状态：start(block=False) 返回的 handle，含 stop/wait/is_running
+_live_state = {"handle": None}
+
+
+def _live_running() -> bool:
+    """判断推流是否仍在运行（handle 存在且未 stop）。"""
+    h = _live_state.get("handle")
+    if h is None:
+        return False
+    try:
+        return bool(h["is_running"]())
+    except Exception:
+        return False
+
+
+def _live_thread_snapshot() -> str:
+    """返回当前 handle 中所有工作线程的快照文本，用于日志展示。"""
+    h = _live_state.get("handle")
+    if h is None:
+        return ""
+    threads = h.get("threads") or {}
+    if not threads:
+        return ""
+    lines = ["工作线程："]
+    for name, t in threads.items():
+        try:
+            lines.append(f"  - {name}: ident={t.ident}, alive={t.is_alive()}")
+        except Exception:
+            lines.append(f"  - {name}: <unknown>")
+    return "\n".join(lines)
+
+
+def run_live_inference_ui(
+    live_dir,
+    face_size,
+    video_load_mode,
+    audio_loop_mode,
+    batch_size,
+    sync_offset,
+    frame_w,
+    frame_h,
+    port,
+    cam_backend,
+    reverse_random_prob,
+    device,
+):
+    log_capture.clear()
+
+    if _live_running():
+        return ("推流正在运行中，请先点击「停止推流」。",
+                gr.update(interactive=False), gr.update(interactive=True))
+
+    if not live_dir or live_dir.startswith("(尚无直播预处理数据"):
+        return ("请先选择直播预处理数据！",
+                gr.update(interactive=True), gr.update(interactive=False))
+
+    cfg = load_config()
+    api_key = cfg.get("api_key", "").strip()
+    if not api_key:
+        return ("API Key 未配置，请先在『设置』中保存 API Key。",
+                gr.update(interactive=True), gr.update(interactive=False))
+
+    data_dir = str(DATA_LIVE_DIR / live_dir)
+    if not os.path.isdir(data_dir):
+        return (f"数据目录不存在: {data_dir}",
+                gr.update(interactive=True), gr.update(interactive=False))
+
+    face_size = int(face_size)
+    human_path = f"./checkpoints/{face_size}.m.onnx"
+    hubert_path = "./checkpoints/chinese-hubert-large/"
+    if not os.path.exists(human_path):
+        return (f"找不到 Human 模型: {human_path}",
+                gr.update(interactive=True), gr.update(interactive=False))
+    if not os.path.exists(hubert_path):
+        return (f"找不到 Hubert 模型: {hubert_path}",
+                gr.update(interactive=True), gr.update(interactive=False))
+
+    try:
+        from inference_live import InferenceLive
+
+        frame_w = int(frame_w) if frame_w else None
+        frame_h = int(frame_h) if frame_h else None
+        port = int(port) if port else 8886
+
+        # 在主回调线程构造实例，初始化报错可以立即反馈到界面
+        print("[WebUI] 正在初始化 InferenceLive ...")
+        infer = InferenceLive(
+            human_path=human_path,
+            vae_decoder_path=None,
+            hubert_path=hubert_path,
+            device=device,
+            video_load_mode=video_load_mode,
+            audio_loop_mode=audio_loop_mode,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            sync_offset=int(sync_offset),
+            batch_size=int(batch_size),
+            api_key=api_key,
+            port=port,
+            cam_backend=cam_backend,
+            reverse_random_prob=float(reverse_random_prob),
+        )
+
+        # 用 block=False 启动，立刻拿到 handle；
+        # 内部 4 个工作线程 + api_server 线程都登记在 handle["threads"]
+        # handle["stop"]() / handle["wait"]() 是优雅停止入口
+        handle = infer.start(data_dir=data_dir, block=False)
+        _live_state["handle"] = handle
+
+        snapshot = _live_thread_snapshot()
+        print(f"[WebUI] 推流已启动: data_dir={data_dir}, /set_audio 端口={port}\n{snapshot}")
+        msg = (
+            f"推流已启动！\n数据目录: {data_dir}\n"
+            f"虚拟摄像头已打开，/set_audio 服务端口: {port}\n"
+            f"外部可 POST http://127.0.0.1:{port}/set_audio 切换音频。\n\n{snapshot}"
+        )
+        return (msg, gr.update(interactive=False), gr.update(interactive=True))
+    except Exception as e:
+        traceback.print_exc()
+        _live_state["handle"] = None
+        return (f"推流启动失败: {e}",
+                gr.update(interactive=True), gr.update(interactive=False))
+
+
+def stop_live_inference_ui():
+    """优雅停止推流：handle.stop() → handle.wait()。"""
+    h = _live_state.get("handle")
+    if h is None or not _live_running():
+        _live_state["handle"] = None
+        return ("当前没有在运行的推流。",
+                gr.update(interactive=True), gr.update(interactive=False))
+
+    print("[WebUI] 收到停止推流请求，正在关闭...")
+    try:
+        h["stop"]()
+    except Exception as e:
+        print(f"[stop] stop() 异常: {e}")
+
+    try:
+        h["wait"](timeout=10)
+    except Exception as e:
+        print(f"[stop] wait() 异常: {e}")
+
+    _live_state["handle"] = None
+    print("[WebUI] 推流已停止。")
+    return ("推流已停止。",
+            gr.update(interactive=True), gr.update(interactive=False))
+
+
+# ============== 任务 5：发送 /set_audio 请求 ==============
+def send_set_audio_ui(audio, host, port, interrupt):
+    """上传音频 → 暂存为无中文/空格路径 → POST /set_audio {"path":..., "interrupt":...}"""
+    if not audio:
+        return "请先上传要发送的音频！"
+    src = _resolve_uploaded_path(audio)
+    if not src or not os.path.exists(src):
+        return "音频文件不存在！"
+
+    host = (host or "http://127.0.0.1").strip().rstrip("/")
+    try:
+        port = int(port) if port else 8886
+    except Exception:
+        return "端口必须是数字！"
+
+    try:
+        # 暂存音频到本地无中文/空格路径（推流端用 shell=True 调 ffmpeg，路径必须干净）
+        stage_dir = Path(__file__).parent.resolve() / "temp" / "set_audio"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        suffix = Path(src).suffix or ".wav"
+        staged = stage_dir / f"{uuid.uuid4().hex}{suffix}"
+        shutil.copy(src, staged)
+
+        url = f"{host}:{port}/set_audio"
+        payload = json.dumps(
+            {"path": str(staged), "interrupt": bool(interrupt)}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        print(f"[WebUI] 发送 /set_audio: {url}, path={staged}, interrupt={bool(interrupt)}")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            text = resp.read().decode("utf-8", "ignore")
+        return f"发送成功 (HTTP {resp.status}): {text}"
+    except Exception as e:
+        return f"发送失败: {e}"
+
+
 # ============== Gradio 界面 ==============
 def build_ui():
     cfg = load_config()
     cuda_choices = list_cuda_devices()
+    # 直播模式仅支持 CUDA
+    cuda_only_choices = [d for d in cuda_choices if d.startswith("cuda")] or ["cuda"]
 
     custom_css = """
     /* 全局字体 */
@@ -864,7 +1236,209 @@ def build_ui():
                             elem_classes=["log-box"],
                         )
 
-            # ----------- Tab 3：使用说明 -----------
+            # ----------- Tab 3：直播预处理 -----------
+            with gr.Tab("③ 直播预处理"):
+                gr.Markdown(
+                    "### 上传视频 + 选择音频目录，生成直播推流数据（`data_live/<标题>/`）\n"
+                    "> 视频会转成 25fps + 人脸检测 + VAE 编码；音频走 HuBERT 切片 + 44.1kHz 立体声 wav。"
+                )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        live_title_in = gr.Textbox(
+                            label="📌 直播标题 (必填，输出目录为 data_live/<标题>/)",
+                            placeholder="例如: live_demo",
+                            max_lines=1,
+                        )
+                        live_video_in = gr.Video(
+                            label="上传视频 (mp4 / avi)",
+                            sources=["upload"],
+                            height=280,
+                        )
+                        live_audios_in = gr.Textbox(
+                            label="🎵 音频目录（本地路径，音频文件按文件名数字排序）",
+                            placeholder="输入目录路径，或点击下方按钮选择",
+                            max_lines=1,
+                        )
+                        live_audios_pick_btn = gr.Button("📂 选择音频目录")
+                        live_face_size = gr.Radio(
+                            choices=[256, 384],
+                            value=256,
+                            label="人脸尺寸 face_size (与模型匹配)",
+                        )
+                        live_res_preset = gr.Radio(
+                            choices=["不压缩(原分辨率)", "480p", "720p", "1080p"],
+                            value="1080p",
+                            label="分辨率压缩档位",
+                        )
+                        live_frame_batch = gr.Slider(
+                            minimum=4,
+                            maximum=128,
+                            value=64,
+                            step=4,
+                            label="每批处理帧数 (显存不足调小)",
+                        )
+                        live_sync_offset_pre = gr.Slider(
+                            minimum=-20,
+                            maximum=20,
+                            value=0,
+                            step=1,
+                            label="音视频同步偏移 (帧)",
+                        )
+                        live_device_pre = gr.Radio(
+                            choices=cuda_only_choices,
+                            value=cuda_only_choices[0],
+                            label="计算设备（直播模式仅支持 CUDA）",
+                        )
+                        live_pre_btn = gr.Button("🚀 开始直播预处理", variant="primary")
+
+                    with gr.Column(scale=1):
+                        live_pre_status = gr.Textbox(
+                            label="直播预处理状态",
+                            interactive=False,
+                            lines=3,
+                        )
+                        gr.Markdown("#### 处理日志")
+                        live_pre_log = gr.Textbox(
+                            label="日志",
+                            interactive=False,
+                            lines=1,
+                            autoscroll=True,
+                            max_lines=20,
+                            elem_classes=["log-box"],
+                        )
+
+            # ----------- Tab 4：直播推流 -----------
+            with gr.Tab("④ 直播推流"):
+                gr.Markdown(
+                    "### 选择直播预处理数据，实时推理并推送到虚拟摄像头 + 扬声器\n"
+                    "> 内置 FastAPI 服务（`POST /set_audio`）可接收外部音频切换播放；"
+                    "> 停止推流会销毁后台线程并释放虚拟摄像头/音频。"
+                )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        live_dir_in = gr.Dropdown(
+                            choices=list_live_data_dirs(),
+                            label="选择直播预处理数据 (data_live/<标题>/)",
+                            value=list_live_data_dirs()[0],
+                            allow_custom_value=True,
+                        )
+                        live_refresh_btn = gr.Button("🔄 刷新列表")
+                        live_face_size_inf = gr.Radio(
+                            choices=[256, 384],
+                            value=256,
+                            label="人脸尺寸 (与预处理数据一致)",
+                        )
+                        live_video_load_mode = gr.Radio(
+                            choices=["full", "streaming"],
+                            value="full",
+                            label="视频数据加载方式  full=全量 / streaming=流式",
+                        )
+                        live_audio_loop_mode = gr.Radio(
+                            choices=["random", "sequential"],
+                            value="random",
+                            label="音频播放顺序  random=随机 / sequential=顺序",
+                        )
+                        live_batch = gr.Slider(
+                            minimum=1,
+                            maximum=512,
+                            value=2,
+                            step=1,
+                            label="推理 batch_size (实时建议 1)",
+                        )
+                        live_sync_offset = gr.Slider(
+                            minimum=-20,
+                            maximum=20,
+                            value=0,
+                            step=1,
+                            label="音视频同步偏移 (帧)",
+                        )
+                        with gr.Row():
+                            live_frame_w = gr.Number(
+                                label="虚拟摄像头宽度 (留空=按预处理数据)",
+                                value=None,
+                                precision=0,
+                            )
+                            live_frame_h = gr.Number(
+                                label="虚拟摄像头高度 (留空=按预处理数据)",
+                                value=None,
+                                precision=0,
+                            )
+                        with gr.Row():
+                            live_port = gr.Number(
+                                label="/set_audio 服务端口",
+                                value=8886,
+                                precision=0,
+                            )
+                            live_cam_backend = gr.Radio(
+                                choices=["obs", "unitycapture"],
+                                value="obs",
+                                label="虚拟摄像头后端",
+                            )
+                        live_reverse_prob = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=0.1,
+                            step=0.05,
+                            label="随机反转人脸关键点概率",
+                        )
+                        live_device_inf = gr.Radio(
+                            choices=cuda_only_choices,
+                            value=cuda_only_choices[0],
+                            label="计算设备（直播模式仅支持 CUDA）",
+                        )
+                        with gr.Row():
+                            live_start_btn = gr.Button("🎥 开始推流", variant="primary")
+                            live_stop_btn = gr.Button("⏹ 停止推流", variant="stop")
+
+                    with gr.Column(scale=1):
+                        live_infer_status = gr.Textbox(
+                            label="推流状态",
+                            interactive=False,
+                            lines=4,
+                        )
+                        gr.Markdown("#### 推流日志")
+                        live_infer_log = gr.Textbox(
+                            label="日志",
+                            interactive=False,
+                            lines=1,
+                            autoscroll=True,
+                            max_lines=20,
+                            elem_classes=["log-box"],
+                        )
+
+                # ----------- 独立块：发送 /set_audio 请求 -----------
+                with gr.Group():
+                    gr.Markdown(
+                        "#### 📤 发送 /set_audio 请求（向运行中的推流切换播放音频）"
+                    )
+                    with gr.Row():
+                        set_audio_file = gr.Audio(
+                            label="上传音频 (wav / mp3)",
+                            sources=["upload"],
+                            type="filepath",
+                        )
+                    with gr.Row():
+                        set_audio_host = gr.Textbox(
+                            label="服务地址",
+                            value="http://127.0.0.1",
+                        )
+                        set_audio_port = gr.Number(
+                            label="端口",
+                            value=8886,
+                            precision=0,
+                        )
+                        set_audio_interrupt = gr.Checkbox(
+                            label="打断当前播放 (interrupt)",
+                            value=True,
+                        )
+                        set_audio_btn = gr.Button("📨 发送 POST 请求", variant="secondary")
+                    set_audio_status = gr.Textbox(
+                        label="发送结果",
+                        interactive=False,
+                        lines=2,
+                    )
+
+            # ----------- Tab 5：使用说明 -----------
             with gr.Tab("📖 使用说明"):
                 gr.Markdown(
                     f"""
@@ -872,6 +1446,13 @@ def build_ui():
                     1. **⚙️ 设置**：填入 API Key、选择推理设备，点击「保存配置」（保存到 `{CONFIG_PATH}`）。
                     2. **① 视频预处理**：填任务标题（将作为 `data/<标题>/` 目录名），上传视频，开始预处理。
                     3. **② 音频驱动推理**：选择 `data/<标题>/`，上传音频，开始推理。
+
+                    ### 直播流程
+                    4. **③ 直播预处理**：填直播标题（输出到 `data_live/<标题>/`），上传视频并选择音频目录，开始预处理。
+                    5. **④ 直播推流**：选择直播预处理数据，点「开始推流」实时输出到虚拟摄像头 + 扬声器；
+                       点「停止推流」销毁后台线程并释放资源。
+                    6. **发送 /set_audio**：推流页底部独立块，上传音频并填写服务地址/端口/是否打断，
+                       点「发送 POST 请求」即可向运行中的推流切换播放音频。
 
                     ### 关于 API Key
                     - **注册地址：[https://lstmsync.andclaw.cn/](https://lstmsync.andclaw.cn/)**
@@ -918,10 +1499,70 @@ def build_ui():
             outputs=preprocess_dir_in,
         )
 
+        live_audios_pick_btn.click(
+            fn=pick_folder,
+            inputs=[live_audios_in],
+            outputs=live_audios_in,
+        )
+
+        live_pre_btn.click(
+            fn=run_live_preprocess_ui,
+            inputs=[
+                live_title_in,
+                live_video_in,
+                live_audios_in,
+                live_face_size,
+                live_frame_batch,
+                live_res_preset,
+                live_sync_offset_pre,
+                live_device_pre,
+            ],
+            outputs=[live_pre_status, live_dir_in],
+        )
+
+        live_start_btn.click(
+            fn=run_live_inference_ui,
+            inputs=[
+                live_dir_in,
+                live_face_size_inf,
+                live_video_load_mode,
+                live_audio_loop_mode,
+                live_batch,
+                live_sync_offset,
+                live_frame_w,
+                live_frame_h,
+                live_port,
+                live_cam_backend,
+                live_reverse_prob,
+                live_device_inf,
+            ],
+            outputs=[live_infer_status, live_start_btn, live_stop_btn],
+        )
+
+        live_stop_btn.click(
+            fn=stop_live_inference_ui,
+            outputs=[live_infer_status, live_start_btn, live_stop_btn],
+        )
+
+        live_refresh_btn.click(
+            list_live_data_dirs_ui,
+            outputs=live_dir_in,
+        )
+
+        set_audio_btn.click(
+            fn=send_set_audio_ui,
+            inputs=[set_audio_file, set_audio_host, set_audio_port, set_audio_interrupt],
+            outputs=set_audio_status,
+        )
+
         # ----------- 页面加载时刷新预处理列表（避免 Timer.tick 在某些环境下导致组件渲染异常） -----------
         demo.load(
             list_preprocess_dirs_ui,
             outputs=preprocess_dir_in,
+        )
+        demo.load(
+            list_live_data_dirs_ui,
+            outputs=live_dir_in,
         )
 
         # ----------- 定时刷新日志面板 -----------
@@ -939,8 +1580,9 @@ def build_ui():
         }
         """
         timer.tick(
-            fn=lambda: (log_capture.get_text(), log_capture.get_text()),
-            outputs=[pre_log, infer_log],
+            fn=lambda: (log_capture.get_text(), log_capture.get_text(),
+                        log_capture.get_text(), log_capture.get_text()),
+            outputs=[pre_log, infer_log, live_pre_log, live_infer_log],
             js=scroll_js,
         )
 
