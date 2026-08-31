@@ -895,9 +895,12 @@ def run_live_inference_ui(
 
         # 在主回调线程构造实例，初始化报错可以立即反馈到界面
         print("[WebUI] 正在初始化 InferenceLive ...")
+        # pyd 打包后的 InferenceLive 不再允许 vae_decoder_path=None，
+        # 显式从 human_path 同目录推断 decoder 路径
+        vae_decoder_path = f"./checkpoints/{face_size}.decoder.onnx"
         infer = InferenceLive(
             human_path=human_path,
-            vae_decoder_path=None,
+            vae_decoder_path=vae_decoder_path,
             hubert_path=hubert_path,
             device=device,
             video_load_mode=video_load_mode,
