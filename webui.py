@@ -962,8 +962,8 @@ def stop_live_inference_ui():
 
 
 # ============== 任务 5：发送 /set_audio 请求 ==============
-def send_set_audio_ui(audio, host, port, interrupt):
-    """上传音频 → 暂存为无中文/空格路径 → POST /set_audio {"path":..., "interrupt":...}"""
+def send_set_audio_ui(audio, host, port, interrupt, is_save):
+    """上传音频 → 暂存为无中文/空格路径 → POST /set_audio {"path":..., "interrupt":..., "is_save":...}"""
     if not audio:
         return "请先上传要发送的音频！"
     src = _resolve_uploaded_path(audio)
@@ -986,7 +986,7 @@ def send_set_audio_ui(audio, host, port, interrupt):
 
         url = f"{host}:{port}/set_audio"
         payload = json.dumps(
-            {"path": str(staged), "interrupt": bool(interrupt)}).encode("utf-8")
+            {"path": str(staged), "interrupt": bool(interrupt), "is_save": bool(is_save)}).encode("utf-8")
         req = urllib.request.Request(
             url, data=payload,
             headers={"Content-Type": "application/json"}, method="POST")
@@ -1380,7 +1380,7 @@ def build_ui():
                         live_reverse_prob = gr.Slider(
                             minimum=0.0,
                             maximum=1.0,
-                            value=0.1,
+                            value=0,
                             step=0.05,
                             label="随机反转人脸关键点概率",
                         )
@@ -1433,6 +1433,10 @@ def build_ui():
                         set_audio_interrupt = gr.Checkbox(
                             label="打断当前播放 (interrupt)",
                             value=True,
+                        )
+                        set_audio_is_save = gr.Checkbox(
+                            label="保存 wav + npy 到数据目录 (is_save)",
+                            value=False,
                         )
                         set_audio_btn = gr.Button("📨 发送 POST 请求", variant="secondary")
                     set_audio_status = gr.Textbox(
@@ -1554,7 +1558,7 @@ def build_ui():
 
         set_audio_btn.click(
             fn=send_set_audio_ui,
-            inputs=[set_audio_file, set_audio_host, set_audio_port, set_audio_interrupt],
+            inputs=[set_audio_file, set_audio_host, set_audio_port, set_audio_interrupt, set_audio_is_save],
             outputs=set_audio_status,
         )
 
